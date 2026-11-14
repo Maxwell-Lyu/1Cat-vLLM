@@ -95,7 +95,10 @@ class NixlConnectorWorker:
     ) -> np.ndarray:
         """Compute NIXL descriptor IDs for given block IDs."""
         num_fa_regions = self.num_regions
-        num_ssm_regions = len(self.block_len_per_layer) * 4 if self._has_mamba else 0
+        num_ssm_regions = 0
+        if self._has_mamba:
+            regions_per_page = 1 if self._mamba_sd_same_tp else 4
+            num_ssm_regions = len(self.block_len_per_layer) * regions_per_page
 
         num_blocks = dst_num_blocks
         if block_size_ratio is not None:
@@ -120,7 +123,9 @@ class NixlConnectorWorker:
         logical_blocks = num_blocks // physical_blocks_per_logical
         all_descs: list[np.ndarray] = []
         for i, group in enumerate(block_ids):
-            group_arr = np.asarray(group)
+            if len(group) == 0:
+                continue
+            group_arr = np.asarray(group, dtype=np.int64)
             if _is_attention_spec(self._group_spec_types[i]):
                 fa_region_ids = np.arange(num_fa_regions)[:, None]
                 all_descs.append(
@@ -147,7 +152,7 @@ class NixlConnectorWorker:
                     f"Unknown spec type {self._group_spec_types[i]} at index {i}"
                 )
 
-        return np.concatenate(all_descs)
+        return np.concatenate(all_descs) if all_descs else np.array([], dtype=np.int64)
 
     def _build_local_splits_from_plan(
         self,
@@ -237,6 +242,16 @@ class NixlConnectorWorker:
         }
         self.hma_group_size = len(kv_cache_config.kv_cache_tensors)
 
+        # Opt-in homogeneous SD transport copies a complete logical state page.
+        # It must never fall through to the heterogeneous DS projection splitter.
+        transfer_mode = self.kv_transfer_config.get_from_extra_config(
+            "mamba_transfer_mode", "ds_split"
+        )
+        if transfer_mode not in ("ds_split", "sd_same_tp_v1"):
+            raise ValueError(f"Unknown Mamba transfer mode: {transfer_mode!r}")
+        self._mamba_sd_same_tp = transfer_mode == "sd_same_tp_v1"
+        self._mamba_transfer_mode = transfer_mode
+
         # ---- Model state (derived from model config) ----
         mamba_ssm_size = (0, 0)
         # Conv state sub-projection decomposition (None when no Mamba).
@@ -253,20 +268,40 @@ class NixlConnectorWorker:
                 is_conv_state_dim_first,
             )
 
-            assert is_conv_state_dim_first(), (
-                "3-read Mamba conv transfer requires DS conv state layout. "
-                "Set VLLM_SSM_CONV_STATE_LAYOUT=DS"
-            )
             mamba_spec = next(
                 spec
                 for spec in self._layer_specs.values()
                 if isinstance(spec, MambaSpec)
             )
-            self._conv_decomp = derive_mamba_conv_split(
-                mamba_spec,
-                vllm_config.parallel_config.tensor_parallel_size,
-            )
-            mamba_ssm_size = self._conv_decomp.ssm_sizes
+            if self._mamba_sd_same_tp:
+                if is_conv_state_dim_first():
+                    raise ValueError("sd_same_tp_v1 requires SD conv state layout")
+                if self.kv_transfer_config.kv_buffer_device != "cuda":
+                    raise ValueError("sd_same_tp_v1 requires CUDA KV buffers")
+                state_sizes = tuple(
+                    torch.Size(shape).numel()
+                    * torch.empty((), dtype=dtype).element_size()
+                    for shape, dtype in zip(mamba_spec.shapes, mamba_spec.dtypes)
+                )
+                if len(state_sizes) != 2:
+                    raise ValueError("sd_same_tp_v1 requires conv and temporal states")
+                mamba_ssm_size = (state_sizes[0], state_sizes[1])
+                for spec in self._layer_specs.values():
+                    if isinstance(spec, MambaSpec) and (
+                        spec.shapes != mamba_spec.shapes
+                        or spec.dtypes != mamba_spec.dtypes
+                    ):
+                        raise ValueError("sd_same_tp_v1 requires uniform Mamba states")
+            else:
+                assert is_conv_state_dim_first(), (
+                    "3-read Mamba conv transfer requires DS conv state layout. "
+                    "Set VLLM_SSM_CONV_STATE_LAYOUT=DS"
+                )
+                self._conv_decomp = derive_mamba_conv_split(
+                    mamba_spec,
+                    vllm_config.parallel_config.tensor_parallel_size,
+                )
+                mamba_ssm_size = self._conv_decomp.ssm_sizes
         self._mamba_ssm_size = mamba_ssm_size
 
         # Agent.
@@ -998,6 +1033,7 @@ class NixlConnectorWorker:
             else self.host_buffer_kv_cache_layout,
             block_size=self.block_size,
             ssm_sizes=self._mamba_ssm_size,
+            mamba_transfer_mode=self._mamba_transfer_mode,
             attn_backend_name=self.backend_name,
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
@@ -1011,17 +1047,72 @@ class NixlConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
+    @staticmethod
+    def _build_mamba_pages(
+        base_addresses: list[int],
+        block_lens: list[int],
+        num_blocks: int,
+        physical_per_logical: int,
+        device_id: int,
+    ) -> list[tuple[int, int, int]]:
+        """Describe complete state pages, including padding, without reshaping SD."""
+        if len(base_addresses) != len(block_lens):
+            raise ValueError("Mamba page addresses and strides must match")
+        pages = []
+        for base, physical_stride in zip(base_addresses, block_lens):
+            stride = physical_stride * physical_per_logical
+            for block in range(num_blocks):
+                pages.append((base + block * stride, stride, device_id))
+        return pages
+
+    def _validate_mamba_transfer_peer(
+        self, meta: NixlAgentMetadata, remote_tp_size: int
+    ) -> None:
+        """Reject incompatible peers before importing their NIXL agent metadata."""
+        if not self._has_mamba:
+            return
+        if meta.mamba_transfer_mode != self._mamba_transfer_mode:
+            raise ValueError("P/D Mamba transfer modes must match")
+        if not self._mamba_sd_same_tp:
+            return
+        if remote_tp_size != self.world_size:
+            raise ValueError("sd_same_tp_v1 requires equal P/D tensor parallel sizes")
+        if meta.block_size != self.block_size:
+            raise ValueError("sd_same_tp_v1 requires equal P/D block sizes")
+        if meta.ssm_sizes != self._mamba_ssm_size:
+            raise ValueError("sd_same_tp_v1 requires equal P/D Mamba state sizes")
+        if meta.block_lens != self.block_len_per_layer:
+            raise ValueError("sd_same_tp_v1 requires equal P/D state page strides")
+        if len(meta.kv_caches_base_addr) != len(self.block_len_per_layer):
+            raise ValueError("sd_same_tp_v1 requires equal P/D state region counts")
+        if meta.kv_cache_layout != self.kv_cache_layout:
+            raise ValueError("sd_same_tp_v1 requires equal P/D attention cache layouts")
+        physical = self._physical_blocks_per_logical_kv_block
+        if meta.physical_blocks_per_logical_kv_block != physical:
+            raise ValueError("sd_same_tp_v1 requires equal physical block ratios")
+        if meta.num_blocks % physical:
+            raise ValueError("Remote Mamba pages contain a partial logical block")
+        if any(length * physical < sum(meta.ssm_sizes) for length in meta.block_lens):
+            raise ValueError("Remote Mamba state exceeds its registered page stride")
+
     def _build_mamba_local(
         self,
         base_addresses: list[int],
         block_size_ratio: int,
     ) -> list[tuple[int, int, int]]:
-        """Build 4 desc regions (x, B, C, ssm) per layer for local mamba
-        blocks, enabling the 3-read transfer with DS conv layout."""
+        """Build complete SD pages or four DS projection/temporal regions."""
         assert block_size_ratio == 1, (
             "Mamba 3-read transfer with block_size_ratio != 1 is not tested. "
             f"Got block_size_ratio={block_size_ratio}."
         )
+        if self._mamba_sd_same_tp:
+            return self._build_mamba_pages(
+                base_addresses,
+                self.block_len_per_layer,
+                self._logical_num_blocks,
+                self._physical_blocks_per_logical_kv_block,
+                self.device_id,
+            )
         assert self._conv_decomp is not None
         conv_offsets = self._conv_decomp.local_conv_offsets
         conv_size, ssm_size = self._mamba_ssm_size
@@ -1057,9 +1148,18 @@ class NixlConnectorWorker:
         tp_ratio: int,
         transfer_info: EngineTransferInfo,
     ) -> list[tuple[int, int, int]]:
-        """Build 4 remote desc regions (proj0, proj1, proj2, ssm) per layer
-        for the 3-read transfer.  For hetero-TP, each D rank reads only its
-        sub-projection slice from the P rank."""
+        """Build whole SD pages, or DS slices for heterogeneous TP peers."""
+        if self._mamba_sd_same_tp:
+            if tp_ratio != 1:
+                raise ValueError("SD whole-page transfer requires equal TP sizes")
+            physical = transfer_info.remote_physical_blocks_per_logical
+            return self._build_mamba_pages(
+                nixl_agent_meta.kv_caches_base_addr,
+                nixl_agent_meta.block_lens,
+                nixl_agent_meta.num_blocks // physical,
+                physical,
+                nixl_agent_meta.device_id,
+            )
         assert self._conv_decomp is not None
         effective_ratio = max(tp_ratio, 1)
         # Mamba conv state is always TP-sharded, even when attention KV
@@ -1210,13 +1310,10 @@ class NixlConnectorWorker:
         )
         if self._has_mamba:
             assert self.num_descs == len(blocks_data)
-            # TODO (ZhanqiuHu): For homogeneous TP (tp_ratio == 1), the 3-descs split
-            # is unnecessary — a single conv desc per block suffices.  Consider
-            # adding a fast path that falls back to the standard 2-region
-            # registration (_build_fa_local mamba=True) when no hetero-TP
-            # remote has been seen.  Currently we always register 4 regions
-            # because local descs are created before knowing the remote TP.
-            logger.debug("Registering local Mamba descriptors (4 regions/layer)")
+            logger.debug(
+                "Registering local Mamba descriptors (mode=%s)",
+                self._mamba_transfer_mode,
+            )
             blocks_data.extend(
                 self._build_mamba_local(local_base_addresses, block_size_ratio)
             )
@@ -1284,6 +1381,8 @@ class NixlConnectorWorker:
                 remote_tp_rank,
             )
             return self._remote_agents[engine_id][remote_tp_rank]
+
+        self._validate_mamba_transfer_peer(nixl_agent_meta, remote_tp_size)
 
         ### Register remote engine in TransferTopology (idempotent).
         assert self.transfer_topo is not None
@@ -2304,6 +2403,21 @@ class NixlConnectorWorker:
         to the minimum count to handle kernel block count discrepancies from
         logical block rounding in heterogeneous TP.
         """
+        if self._has_mamba and getattr(self, "_mamba_sd_same_tp", False):
+            # The receiver supplies newly allocated/unhashed suffix blocks.
+            # Align-mode Mamba tables on P also contain null/cached prefix slots;
+            # their final slots hold the running state and speculative states.
+            # Equal TP and physical block ratios were checked at handshake.
+            if len(local_block_ids) != len(remote_block_ids):
+                raise ValueError("P/D SD cache group counts must match")
+            trimmed_remote = []
+            for local_group, remote_group in zip(local_block_ids, remote_block_ids):
+                count = len(local_group)
+                if count > len(remote_group):
+                    raise ValueError("Remote SD cache has fewer blocks than requested")
+                trimmed_remote.append(list(remote_group[-count:]) if count else [])
+            return local_block_ids, trimmed_remote
+
         # Partial prefix cache hit: just read uncomputed blocks.
         # Skip mamba groups — their blocks represent full state (conv+ssm),
         # not per-token data, so trimming would corrupt the transfer.

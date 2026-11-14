@@ -35,7 +35,8 @@ GET_META_MSG = b"get_meta_msg"
 #   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata
 #   4: Add KV block lease renewal through heartbeats
 #
-NIXL_CONNECTOR_VERSION: int = 4
+#   5: Add opt-in SD whole-page transfer for homogeneous TP peers.
+NIXL_CONNECTOR_VERSION: int = 5
 
 
 @dataclass
@@ -51,6 +52,7 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    mamba_transfer_mode: str = "ds_split"
 
 
 @dataclass
@@ -118,6 +120,13 @@ def compute_nixl_compatibility_hash(
         "cache_dtype": str(cache_config.cache_dtype),
         "cross_layers_blocks": cross_layers_blocks,
         "is_hma_enabled": is_hma_enabled,
+        "mamba_transfer_mode": (
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "mamba_transfer_mode", "ds_split"
+            )
+            if vllm_config.kv_transfer_config is not None
+            else "ds_split"
+        ),
     }
 
     compat_hash = hash_factors(factors)

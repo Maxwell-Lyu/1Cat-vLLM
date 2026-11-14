@@ -26,7 +26,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlHandshakePayload,
     ReqId,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import zmq_ctx
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    get_representative_spec_type,
+    zmq_ctx,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -431,6 +434,48 @@ class NixlConnectorScheduler:
         # No remote prefill for this request.
         return 0, False
 
+    def _clip_sd_prefill_blocks(
+        self, blocks: "KVCacheBlocks", params: dict, num_external_tokens: int
+    ) -> BlockIds:
+        """Map valid prompt pages by their absolute block-table positions."""
+        remote_tokens = int(params["remote_num_tokens"])
+        if remote_tokens < num_external_tokens:
+            raise ValueError("Remote SD prefill has fewer tokens than requested")
+        remote_ids = list(params["remote_block_ids"])
+        groups = self.kv_cache_config.kv_cache_groups
+        if len(blocks.blocks) != len(groups) or len(remote_ids) != len(groups):
+            raise ValueError("P/D SD cache group counts must match")
+        local_ids = []
+        for i, group in enumerate(groups):
+            spec = group.kv_cache_spec
+            spec_type = get_representative_spec_type(spec)
+            table = blocks.blocks[i]
+            if issubclass(spec_type, (FullAttentionSpec, SlidingWindowSpec)):
+                end = cdiv(remote_tokens, spec.block_size)
+                if len(remote_ids[i]) < end or len(table) < end:
+                    raise ValueError("SD prefill token range exceeds allocated pages")
+                selected = [
+                    index
+                    for index, block in enumerate(table[:end])
+                    if not block.is_null and block.block_hash is None
+                ]
+                if any(remote_ids[i][index] == 0 for index in selected):
+                    raise ValueError("Remote SD prefill is missing an uncached page")
+                local_ids.append([table[index].block_id for index in selected])
+                remote_ids[i] = [remote_ids[i][index] for index in selected]
+            elif issubclass(spec_type, MambaSpec):
+                local_ids.append(
+                    [
+                        block.block_id
+                        for block in table
+                        if not block.is_null and block.block_hash is None
+                    ]
+                )
+            else:
+                raise ValueError(f"SD prefill does not support {spec_type.__name__}")
+        params["remote_block_ids"] = remote_ids
+        return local_ids
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -480,6 +525,18 @@ class NixlConnectorScheduler:
                     local_block_ids = self.get_sw_clipped_blocks(
                         unhashed_local_block_ids
                     )
+
+                    assert self.vllm_config.kv_transfer_config is not None
+                    if (
+                        num_external_tokens > 0
+                        and self.vllm_config.kv_transfer_config.get_from_extra_config(
+                            "mamba_transfer_mode", "ds_split"
+                        )
+                        == "sd_same_tp_v1"
+                    ):
+                        local_block_ids = self._clip_sd_prefill_blocks(
+                            blocks, params, num_external_tokens
+                        )
 
                     # Get unhashed blocks to pull from remote. Mind that a full prefix
                     # cache hit is indicated with an empty list.
@@ -657,8 +714,15 @@ class NixlConnectorScheduler:
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.
             # Here we "unpad" blocks to send the actual remote blocks to be read.
-            block_ids = self.get_sw_clipped_blocks(block_ids)
-
+            assert self.vllm_config.kv_transfer_config is not None
+            if (
+                self.vllm_config.kv_transfer_config.get_from_extra_config(
+                    "mamba_transfer_mode", "ds_split"
+                )
+                != "sd_same_tp_v1"
+            ):
+                block_ids = self.get_sw_clipped_blocks(block_ids)
+            # SD peers select by absolute position, retaining SWA null prefix slots.
             remote_num_tokens = request.num_computed_tokens
 
         return delay_free_blocks, dict(
